@@ -1,0 +1,207 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+struct Ray
+{
+    float3 origin;
+    float3 direction;
+    float3 energy;
+};
+
+struct RayHit
+{
+    float3 position;
+    float distance;
+    float3 normal;
+    float3 albedo;
+    float3 specular;
+};
+
+struct Sphere
+{
+    float3 position;
+    float radius;
+    float3 albedo;
+    float3 specular;
+};
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture2D<float4> Result;
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+Texture2D<float4> _SkyboxTexture;
+SamplerState sampler_SkyboxTexture;
+float2 _PixelOffset;
+int _MaximumBounce;
+float4 _Time;
+float4 _DirectionalLight;
+StructuredBuffer<Sphere> _Spheres;
+
+
+static const float PI = 3.14159265f;
+static const float INF = 1 / 0.00000000000000001f;
+
+
+
+Sphere CreateSphere(float3 position, float radius, float3 albedo, float3 specular)
+{
+    Sphere sphere;
+    sphere.position = position;
+    sphere.radius = radius;
+    sphere.albedo = albedo;
+    sphere.specular = specular;
+    return sphere;
+}
+
+Ray CreateRay (float3 origin, float3 direction)
+{
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    ray.energy = float3(1, 1, 1);
+    return ray;
+}
+
+RayHit CreateRayHit ()
+{
+    RayHit hit;
+    hit.position = float3(0, 0, 0);
+    hit.distance = INF;
+    hit.normal = float3(0, 0, 0);
+    hit.albedo = float3(0, 0, 0);
+    hit.specular = float3(0, 0, 0);
+    return hit;
+}
+
+Ray CreateCameraRay (float2 uv)
+{
+    float3 origin = mul(_CameraToWorld, float4(0, 0, 0, 1)).xyz;
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0, 1)).xyz;
+    direction = mul(_CameraToWorld, float4(direction, 0)).xyz;
+    direction = normalize(direction);
+
+    return CreateRay(origin, direction);
+}
+
+float Random(float2 uv)
+{
+    return frac(sin(dot(uv, float2(12.9898, 78.233))) * 43758.5453123);
+}
+
+void IntersectGroundPlane (Ray ray, inout RayHit bestHit)
+{
+    // -1 because if vector is pointing down, hence t will become positive 
+    float t = ray.origin.y / ray.direction.y * -1;
+
+    if (t > 0 && t < bestHit.distance)
+    {
+        bestHit.distance = t;
+        bestHit.position = ray.origin + t * ray.direction;
+        bestHit.normal = float3(0, 1, 0);
+        bestHit.albedo = float3(0.1, 0.2, 0.3);
+        bestHit.specular = float3(0.3, 0.3, 0.3);
+    }
+}
+
+void IntersectSphere(Ray ray, inout RayHit bestHit, Sphere sphere)
+{
+    float3 sphereToOriginVect = ray.origin - sphere.position;
+    float p1 = -dot(ray.direction, sphereToOriginVect);
+    float p2sqr = pow(p1, 2) - dot(sphereToOriginVect, sphereToOriginVect) + pow(sphere.radius, 2);
+
+    if (p2sqr < 0) return;
+
+    float p2 = sqrt(p2sqr);
+    float t = p1 - p2 > 0 ? p1 - p2 : p1 + p2;
+
+    if (t > 0 && t < bestHit.distance)
+    {
+        bestHit.distance = t;
+        bestHit.position = ray.origin + t * ray.direction;
+        bestHit.normal = normalize(bestHit.position - sphere.position);
+        bestHit.albedo = sphere.albedo;
+        bestHit.specular = sphere.specular;
+    }
+}
+
+void IntersectManySpheres(Ray ray, inout RayHit bestHit)
+{
+    uint nSpheres, stride;
+    _Spheres.GetDimensions(nSpheres, stride);
+
+    for (uint i = 0; i < nSpheres; i++)
+    {
+        IntersectSphere(ray, bestHit, _Spheres[i]);
+    }
+}
+
+RayHit Trace (Ray ray)
+{
+    RayHit bestHit = CreateRayHit();
+    IntersectGroundPlane(ray, bestHit);
+    IntersectManySpheres(ray, bestHit);
+    return bestHit;
+}
+
+float3 Shade (inout Ray ray, RayHit hit)
+{
+
+    if (hit.distance < INF)
+    {
+        // addition to prevent hitting the same object repeatedly
+        float3 nextOrigin = hit.position + hit.normal * 0.001f;
+        
+        Ray shadowRay = CreateRay(nextOrigin, -_DirectionalLight.xyz);
+        RayHit shadowHit = Trace(shadowRay);
+
+        ray.origin = nextOrigin;
+        ray.direction = reflect(ray.direction, hit.normal);
+        ray.energy *= hit.specular;
+
+        if (shadowHit.distance != INF) {
+            return float3(0, 0, 0);
+        }
+
+        // -1 to inverse the direction of light
+        float lambertian = saturate(dot(hit.normal, _DirectionalLight.xyz) * -1);
+        return lambertian * _DirectionalLight.w * hit.albedo;
+    }
+    else
+    {
+        ray.energy = 0;
+
+        float theta = acos(ray.direction.y) / -PI;
+        float phi = atan2(ray.direction.x, -ray.direction.z) / -PI * 0.5f;
+        return _SkyboxTexture.SampleLevel(sampler_SkyboxTexture, float2(phi, theta), 0).xyz;
+    }
+}
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    uint width, height;
+    Result.GetDimensions(width, height);
+
+    // normalize uv to 0 to 1
+    // add offset for anti-aliasing
+    float2 uv = float2((id.xy + _PixelOffset) / float2(width, height));
+    
+    // remap uv to -1 to 1
+    uv = uv * 2.0f - 1.0f;
+
+    Ray ray = CreateCameraRay(uv);
+    float3 result = float3(0, 0, 0);
+    for (int i = 0; i < _MaximumBounce; i++)
+    {
+        RayHit hit = Trace(ray);
+        result += ray.energy * Shade(ray, hit);
+
+        if (!any(ray.energy))
+            break;
+
+    }
+    Result[id.xy] = float4(result, 1);
+
+
+}
