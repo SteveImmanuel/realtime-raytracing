@@ -30,18 +30,21 @@ struct Sphere
 RWTexture2D<float4> Result;
 float4x4 _CameraToWorld;
 float4x4 _CameraInverseProjection;
+
 Texture2D<float4> _SkyboxTexture;
 SamplerState sampler_SkyboxTexture;
-float2 _PixelOffset;
+
 int _MaximumBounce;
 float4 _Time;
 float4 _DirectionalLight;
-StructuredBuffer<Sphere> _Spheres;
+float _RandomSeed;
 
+StructuredBuffer<Sphere> _Spheres;
+float2 _PixelOffset;
+float2 _currentPixel;
 
 static const float PI = 3.14159265f;
 static const float INF = 1 / 0.00000000000000001f;
-
 
 
 Sphere CreateSphere(float3 position, float radius, float3 albedo, float3 specular)
@@ -54,7 +57,7 @@ Sphere CreateSphere(float3 position, float radius, float3 albedo, float3 specula
     return sphere;
 }
 
-Ray CreateRay (float3 origin, float3 direction)
+Ray CreateRay(float3 origin, float3 direction)
 {
     Ray ray;
     ray.origin = origin;
@@ -63,7 +66,7 @@ Ray CreateRay (float3 origin, float3 direction)
     return ray;
 }
 
-RayHit CreateRayHit ()
+RayHit CreateRayHit()
 {
     RayHit hit;
     hit.position = float3(0, 0, 0);
@@ -74,7 +77,7 @@ RayHit CreateRayHit ()
     return hit;
 }
 
-Ray CreateCameraRay (float2 uv)
+Ray CreateCameraRay(float2 uv)
 {
     float3 origin = mul(_CameraToWorld, float4(0, 0, 0, 1)).xyz;
     float3 direction = mul(_CameraInverseProjection, float4(uv, 0, 1)).xyz;
@@ -84,12 +87,43 @@ Ray CreateCameraRay (float2 uv)
     return CreateRay(origin, direction);
 }
 
-float Random(float2 uv)
+float Random()
 {
-    return frac(sin(dot(uv, float2(12.9898, 78.233))) * 43758.5453123);
+    float result = frac(sin(_RandomSeed / 100.0f * dot(_currentPixel, float2(12.9898f, 78.233f))) * 43758.5453f);
+    _RandomSeed += 1.0f;
+    return result;
 }
 
-void IntersectGroundPlane (Ray ray, inout RayHit bestHit)
+float NormalizedDot(float3 x, float3 y, float f = 1.0f)
+{
+    return saturate(dot(x, y) * f);
+}
+
+float3x3 GetTangentSpace(float3 normal)
+{
+    float3 helper = float3(1, 0, 0);
+    if (abs(normal.x) > .99f)
+    {
+        helper = float3(1, 0, 1);
+    }
+
+    float3 tangent = normalize(cross(normal, helper));
+    float3 bitangent = normalize(cross(normal, tangent));
+    return float3x3(tangent, bitangent, normal);
+}
+
+float3 SampleHemisphere(float3 normal)
+{
+    // Uniformly sample hemisphere direction
+    float cosTheta = Random();
+    float sinTheta = sqrt(max(0.0f, 1.0f - pow(cosTheta, 2)));
+    float phi = 2 * PI * Random();
+    float3 tangentSpaceDir = float3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+
+    return mul(tangentSpaceDir, GetTangentSpace(normal));
+}
+
+void IntersectGroundPlane(Ray ray, inout RayHit bestHit)
 {
     // -1 because if vector is pointing down, hence t will become positive 
     float t = ray.origin.y / ray.direction.y * -1;
@@ -136,7 +170,7 @@ void IntersectManySpheres(Ray ray, inout RayHit bestHit)
     }
 }
 
-RayHit Trace (Ray ray)
+RayHit Trace(Ray ray)
 {
     RayHit bestHit = CreateRayHit();
     IntersectGroundPlane(ray, bestHit);
@@ -144,28 +178,33 @@ RayHit Trace (Ray ray)
     return bestHit;
 }
 
-float3 Shade (inout Ray ray, RayHit hit)
+float3 Shade(inout Ray ray, RayHit hit)
 {
-
     if (hit.distance < INF)
     {
-        // addition to prevent hitting the same object repeatedly
-        float3 nextOrigin = hit.position + hit.normal * 0.001f;
-        
-        Ray shadowRay = CreateRay(nextOrigin, -_DirectionalLight.xyz);
-        RayHit shadowHit = Trace(shadowRay);
+        // // addition to prevent hitting the same object repeatedly
+        // float3 nextOrigin = hit.position + hit.normal * 0.001f;
+        //
+        // Ray shadowRay = CreateRay(nextOrigin, -_DirectionalLight.xyz);
+        // RayHit shadowHit = Trace(shadowRay);
+        //
+        // ray.origin = nextOrigin;
+        // ray.direction = reflect(ray.direction, hit.normal);
+        // ray.energy *= hit.specular;
+        //
+        // if (shadowHit.distance != INF)
+        // {
+        //     return float3(0, 0, 0);
+        // }
+        //
+        // // -1 to inverse the direction of light
+        // float lambertian = saturate(dot(hit.normal, _DirectionalLight.xyz) * -1);
+        // return lambertian * _DirectionalLight.w * hit.albedo;
 
-        ray.origin = nextOrigin;
-        ray.direction = reflect(ray.direction, hit.normal);
-        ray.energy *= hit.specular;
-
-        if (shadowHit.distance != INF) {
-            return float3(0, 0, 0);
-        }
-
-        // -1 to inverse the direction of light
-        float lambertian = saturate(dot(hit.normal, _DirectionalLight.xyz) * -1);
-        return lambertian * _DirectionalLight.w * hit.albedo;
+        ray.origin = hit.position + hit.normal * 0.001f;
+        ray.direction = SampleHemisphere(hit.normal);
+        ray.energy *= 2 * hit.albedo * NormalizedDot(hit.normal, ray.direction);
+        return 0.0f;
     }
     else
     {
@@ -178,15 +217,16 @@ float3 Shade (inout Ray ray, RayHit hit)
 }
 
 [numthreads(8,8,1)]
-void CSMain (uint3 id : SV_DispatchThreadID)
+void CSMain(uint3 id : SV_DispatchThreadID)
 {
     uint width, height;
     Result.GetDimensions(width, height);
+    _currentPixel = id.xy;
 
     // normalize uv to 0 to 1
     // add offset for anti-aliasing
     float2 uv = float2((id.xy + _PixelOffset) / float2(width, height));
-    
+
     // remap uv to -1 to 1
     uv = uv * 2.0f - 1.0f;
 
@@ -199,9 +239,6 @@ void CSMain (uint3 id : SV_DispatchThreadID)
 
         if (!any(ray.energy))
             break;
-
     }
     Result[id.xy] = float4(result, 1);
-
-
 }
